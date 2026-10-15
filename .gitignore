@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/coverage/
+
+# Local configuration and data
+.env
+.env.*
+.env.example
+data/local/
+data/**/*.zarr/
+data/**/*.grib*
+data/**/*.nc
+data/**/*.tif
+data/**/*.tiff
+AGENTS.md
+
+# Tooling and editor files
+.coverage
+.coverage.*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

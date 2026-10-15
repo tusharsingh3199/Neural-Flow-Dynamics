@@ -1,8 +1,70 @@
 # Neural Flow Dynamics
 
-**A physics-aware forecasting and decision-support platform for cyclones, extreme rainfall and floods in India.**
+**A research platform for weather forecasting and disaster decision support in India.**
 
-Neural Flow Dynamics (NFD) connects four things that are usually separate: a live weather map, a regional AI forecasting engine built on continuous-time neural flows, a geospatial hazard and exposure analysis, and a team of AI agents that turns the result into evacuation and response plans for human approval.
+Neural Flow Dynamics (NFD) is intended to connect environmental data, regional forecasting research, geospatial hazard analysis, and human-reviewed disaster planning.
+
+## Implementation status
+
+The repository scaffold, local runtime configuration, initial data contracts, source feasibility checks, and source-independent ingestion core are implemented. The architecture and capability descriptions below are **plans, not implemented or verified features**. There is currently no live weather map, source-specific weather-data adapter, forecast model, official warning feed, hazard or exposure service, operational agent, or response-planning system. No real weather arrays or model results are included.
+
+| Area | Status |
+|---|---|
+| Repository scaffold | Complete (Step 0.1) |
+| Local runtime configuration and health endpoint | Implemented; Compose startup unverified because Docker is unavailable (Step 0.2) |
+| Initial backend and frontend contract types | Implemented; JSON Schema export remains (Step 0.3) |
+| Data-source access and licensing | Partially verified (Step 0.4; see source_registry.json) |
+| Ingestion core | Implemented and tested; provider adapters remain (Step 1.1) |
+| Weather-data API and map | Health endpoint only; data API and map not implemented |
+| Forecasting, hazards, and exposure | Not implemented |
+| Planning, agents, and operations UI | Not implemented |
+
+### Source feasibility snapshot (2026-10-15)
+
+The registry is in [`source_registry.json`](source_registry.json). Checks can be
+rerun from `backend/` with `uv run python -m app.source_feasibility`. TinyFish
+is only called when `--probe-tinyfish` is explicitly supplied and an
+`TINYFISH_API_KEY` is present; the key is never printed.
+
+| Source | Observed result | Remaining caveat |
+|---|---|---|
+| ARCO-ERA5 | Anonymous GCS metadata and variable attributes responded. Stable coverage ends 2026-06-30; ERA5T ends 2026-10-09. Core wind, pressure, precipitation, temperature, SST, and geopotential variables were found. | Metadata only; no arrays downloaded. ERA5T is preliminary, and precipitation accumulation semantics still need a focused data check. |
+| NOAA GFS `noaa-gfs-bdp-pds` | Anonymous S3 listing succeeded; current and prior UTC date prefixes each contained a run object. | This does not prove all forecast lead files are complete or verify the required GRIB parameters. |
+| NOAA GFS `noaa-gfs-pds` | Anonymous listing returned zero keys. | Do not use this candidate bucket. |
+| IBTrACS North Indian v04r01 | Official CSV URL responded with HTTP 200 and a 27,886,424-byte content length. | Direct file/header probe is included in the checker; preserve blank missing values and agency distinctions. |
+| NDMA SACHET | `/CapFeed` is reachable but is an HTML subscription page; visible RSS links loop back to that page. | Exact feed URL and reuse terms remain unresolved; no guessed feed is used. |
+| TinyFish Fetch | Official docs confirm `POST https://api.fetch.tinyfish.ai`, `X-API-Key`, maximum 10 URLs, and a documented daily free allowance. | No API key is configured, so no live API call was made. |
+| OpenStreetMap | Official licensing page confirms ODbL and attribution requirements. | No study-area extract selected; OSM tile/API use has separate policies. |
+| WorldPop | The official site describes open demographic data and an API; this environment's direct catalog probe returned HTTP 403. | Specific India file, year, resolution, access route, and license remain unverified. |
+
+## Local development
+
+Install Docker Desktop, then copy `.env.example` to `.env` in PowerShell with
+`Copy-Item .env.example .env` and set a local PostgreSQL password. Start the
+services with `docker compose up --build`. The
+frontend is at `http://localhost:5173`, the API is at
+`http://localhost:8000`, and dependency health is reported at
+`http://localhost:8000/health`. Stop the services with `docker compose down`;
+use `docker compose down -v` only when intentionally deleting the local
+database volume.
+
+Backend checks: `uv sync --locked --dev`, `uv run pytest`, `uv run ruff check .`,
+and `uv run mypy app` from `backend/`. Apply database migrations with
+`uv run alembic upgrade head` after the Compose database is healthy. Frontend checks: `npm ci`,
+`npm run test -- --run`, `npm run lint`, and `npm run typecheck` from `frontend/`.
+Docker Compose is required to run the integrated database/cache health check.
+The current local environment does not have Docker installed, so container
+startup remains unverified. The passing unit tests mock dependency availability;
+they do not imply a live database or cache connection.
+
+The source feasibility report can be refreshed from `backend/` with
+`uv run python -m app.source_feasibility`. The ingestion command is
+`uv run python -m app.ingestion.run --source SOURCE`; it intentionally fails
+with a clear message until a concrete source adapter is registered. The
+current manifest repository is tested against SQLite in memory, while the
+Alembic migration targets PostgreSQL. No provider file has been ingested yet.
+
+The product name is **Neural Flow Dynamics (NFD)**. “Meteora” in an earlier build-plan draft is not the project name.
 
 ---
 
