@@ -1,228 +1,325 @@
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import WeatherMap from "./WeatherMap";
-import "./weather.css";
+import "./App.css";
 
-const API = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
 
 const LAYERS = [
-  { id: "t2m", label: "Temperature", symbol: "°" },
-  { id: "wind_speed", label: "Wind", symbol: "≋" },
-  { id: "sp", label: "Pressure", symbol: "P" },
-  { id: "tp", label: "Rainfall", symbol: "☂" },
+  { id: "temperature", label: "Temperature", symbol: "°", icon: "thermometer" },
+  { id: "wind", label: "Wind", symbol: "↗", icon: "wind" },
+  { id: "pressure", label: "Pressure", symbol: "P", icon: "gauge" },
+  { id: "rainfall", label: "Rainfall", symbol: "☂", icon: "cloud-rain" },
 ];
+
+const LEGENDS = {
+  temperature: {
+    title: "Temperature",
+    unit: "°C",
+    min: -60,
+    max: 45,
+    labels: ["−60", "−30", "0", "20", "45"],
+  },
+  wind: {
+    title: "Wind speed",
+    unit: "m/s",
+    min: 0,
+    max: 40,
+    labels: ["0", "10", "20", "30", "40"],
+  },
+  pressure: {
+    title: "Surface pressure",
+    unit: "hPa",
+    min: 870,
+    max: 1080,
+    labels: ["870", "920", "970", "1020", "1080"],
+  },
+  rainfall: {
+    title: "Precipitation",
+    unit: "mm",
+    min: 0,
+    max: 50,
+    labels: ["0", "12.5", "25", "37.5", "50"],
+  },
+};
+
+function formatDate(dateString) {
+  if (!dateString) return "Loading date…";
+  const date = new Date(`${dateString}T00:00:00`);
+  return date.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    timeZone: "Asia/Kolkata",
+  });
+}
+
+function formatTime(time) {
+  if (!time) return "--:--";
+  return time;
+}
 
 export default function App() {
   const [dates, setDates] = useState([]);
-  const [dateIndex, setDateIndex] = useState(0);
-  const [weather, setWeather] = useState(null);
-  const [layer, setLayer] = useState("t2m");
+  const [selectedDate, setSelectedDate] = useState("");
+  const [weatherCache, setWeatherCache] = useState({});
   const [frameIndex, setFrameIndex] = useState(0);
+  const [layer, setLayer] = useState("temperature");
   const [playing, setPlaying] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [speed, setSpeed] = useState(800);
 
-  const cache = useRef(new Map());
-  const request = useRef(0);
-  const loadingNext = useRef(false);
+  const weather = weatherCache[selectedDate] || null;
+  const frames = weather?.frames || [];
+  const frame = frames[frameIndex] || null;
 
-  const loadDate = async (date, index) => {
-    if (cache.current.has(date)) {
-      setWeather(cache.current.get(date));
-      setDateIndex(index);
-      setFrameIndex(0);
-      setLoading(false);
-      setError("");
-      return;
-    }
-
-    const id = ++request.current;
-    setLoading(true);
-    setError("");
-
-    try {
-      const response = await fetch(
-        `${API}/api/weather?date=${encodeURIComponent(date)}`
-      );
-      if (!response.ok) throw new Error(`Weather API error: ${response.status}`);
-
-      const data = await response.json();
-      cache.current.set(date, data);
-
-      if (id !== request.current) return;
-      setWeather(data);
-      setDateIndex(index);
-      setFrameIndex(0);
-      setLoading(false);
-    } catch (e) {
-      if (id !== request.current) return;
-      setError(e.message);
-      setLoading(false);
-      setPlaying(false);
-    }
-  };
+  const legend = LEGENDS[layer];
 
   useEffect(() => {
     let cancelled = false;
 
-    fetch(`${API}/api/dates`)
-      .then(r => {
-        if (!r.ok) throw new Error("Could not load available dates");
-        return r.json();
-      })
-      .then(data => {
+    async function loadDates() {
+      try {
+        setError("");
+        const response = await fetch(`${API_BASE}/api/dates`);
+        if (!response.ok) throw new Error(`Dates request failed (${response.status})`);
+
+        const payload = await response.json();
+        const availableDates = (payload.dates || []).slice().sort();
+
         if (cancelled) return;
-        const available = [...data.dates].sort();
-        setDates(available);
+        setDates(availableDates);
 
-        if (available.length) {
-          const preferred = available.indexOf("2026-10-01");
-          loadDate(available[preferred >= 0 ? preferred : 0],
-                   preferred >= 0 ? preferred : 0);
+        if (availableDates.length) {
+          setSelectedDate(availableDates[0]);
         } else {
-          setLoading(false);
-          setError("No weather dates are available.");
+          setError("The backend returned no available dates.");
         }
-      })
-      .catch(e => {
-        if (!cancelled) {
-          setLoading(false);
-          setError(e.message);
-        }
-      });
+      } catch (err) {
+        if (!cancelled) setError(err.message || "Could not load dates.");
+      }
+    }
 
+    loadDates();
     return () => {
       cancelled = true;
-      request.current++;
     };
   }, []);
 
   useEffect(() => {
-    if (!playing || !weather?.frames?.length || loading) return;
+    if (!selectedDate || weatherCache[selectedDate]) return;
 
-    const timer = setTimeout(() => {
-      if (frameIndex < weather.frames.length - 1) {
-        setFrameIndex(i => i + 1);
-        return;
+    const controller = new AbortController();
+
+    async function loadWeather() {
+      setLoading(true);
+      setError("");
+
+      try {
+        const url = `${API_BASE}/api/weather?date=${encodeURIComponent(selectedDate)}`;
+        const response = await fetch(url, { signal: controller.signal });
+
+        if (!response.ok) {
+          throw new Error(`Weather request failed (${response.status})`);
+        }
+
+        const payload = await response.json();
+
+        if (!payload.latitude?.length || !payload.longitude?.length) {
+          throw new Error("The weather response is missing grid coordinates.");
+        }
+
+        setWeatherCache((previous) => ({
+          ...previous,
+          [selectedDate]: payload,
+        }));
+        setFrameIndex(0);
+      } catch (err) {
+        if (err.name !== "AbortError") {
+          setError(err.message || "Could not load weather data.");
+        }
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }
+
+    loadWeather();
+    return () => controller.abort();
+  }, [selectedDate, weatherCache]);
+
+  const changeDate = useCallback((nextDate) => {
+    if (!nextDate) return;
+    setSelectedDate(nextDate);
+    setFrameIndex(0);
+  }, []);
+
+  const moveFrame = useCallback((direction) => {
+    if (!frames.length) return;
+
+    setFrameIndex((current) => {
+      const next = current + direction;
+
+      if (next >= 0 && next < frames.length) return next;
+
+      if (direction > 0) {
+        const dateIndex = dates.indexOf(selectedDate);
+        const nextDate = dates[dateIndex + 1];
+        if (nextDate) {
+          setSelectedDate(nextDate);
+          return 0;
+        }
       }
 
-      const next = dateIndex + 1;
-      if (next < dates.length && !loadingNext.current) {
-        loadingNext.current = true;
-        loadDate(dates[next], next).finally(() => {
-          loadingNext.current = false;
-        });
-      } else {
+      if (direction < 0) {
+        const dateIndex = dates.indexOf(selectedDate);
+        const previousDate = dates[dateIndex - 1];
+        if (previousDate) {
+          setSelectedDate(previousDate);
+          return Math.max(0, (weatherCache[previousDate]?.frames?.length || 1) - 1);
+        }
+      }
+
+      setPlaying(false);
+      return current;
+    });
+  }, [dates, frames.length, selectedDate, weatherCache]);
+
+  useEffect(() => {
+    if (!playing || !frames.length || loading) return undefined;
+
+    const timer = window.setInterval(() => {
+      setFrameIndex((current) => {
+        if (current + 1 < frames.length) return current + 1;
+
+        const dateIndex = dates.indexOf(selectedDate);
+        const nextDate = dates[dateIndex + 1];
+
+        if (nextDate) {
+          setSelectedDate(nextDate);
+          return 0;
+        }
+
         setPlaying(false);
-      }
-    }, speed);
+        return current;
+      });
+    }, 900);
 
-    return () => clearTimeout(timer);
-  }, [playing, weather, frameIndex, dateIndex, dates, speed, loading]);
+    return () => window.clearInterval(timer);
+  }, [playing, frames.length, loading, dates, selectedDate]);
 
-  const frame = weather?.frames?.[frameIndex];
+  const sliderValue = frames.length > 1
+    ? Math.min(frameIndex, frames.length - 1)
+    : 0;
 
-  const chooseDate = index => {
-    setPlaying(false);
-    loadDate(dates[index], index);
-  };
+  const timelineLabel = useMemo(() => {
+    if (!frame) return "Waiting for weather data";
+    return `${formatDate(selectedDate)} · ${formatTime(frame.time)}`;
+  }, [frame, selectedDate]);
 
   return (
-    <main className="weather-app">
+    <main className="nfd-app">
       <WeatherMap
         weather={weather}
         layer={layer}
         frameIndex={frameIndex}
-        showWind={layer === "wind_speed"}
       />
 
-      <nav className="layer-rail" aria-label="Weather layers">
-        {LAYERS.map(item => (
+      <aside className="layer-toolbar" aria-label="Weather layers">
+        {LAYERS.map((item) => (
           <button
             key={item.id}
+            className={`layer-button ${layer === item.id ? "active" : ""}`}
+            onClick={() => setLayer(item.id)}
             title={item.label}
             aria-label={item.label}
             aria-pressed={layer === item.id}
-            className={`layer-circle ${layer === item.id ? "active" : ""}`}
-            onClick={() => setLayer(item.id)}
           >
             <span className="layer-symbol">{item.symbol}</span>
             <span className="layer-label">{item.label}</span>
           </button>
         ))}
-      </nav>
+      </aside>
 
-      {(loading || error) && (
-        <div className={`status-toast ${error ? "has-error" : ""}`}>
-          {error || "Loading weather…"}
+      <div className="map-status">
+        <span className={`status-dot ${loading ? "loading" : ""}`} />
+        <span>{loading ? "Loading weather" : "ERA5 weather"}</span>
+        {weather?.source && <span className="source-name">{weather.source}</span>}
+      </div>
+
+      <section className="legend-panel" aria-label={`${legend.title} legend`}>
+        <div className="legend-heading">
+          <div>
+            <strong>{legend.title}</strong>
+            <span>{legend.unit}</span>
+          </div>
+          <small>{formatDate(selectedDate)}</small>
         </div>
-      )}
+        <div className="legend-gradient" />
+        <div className="legend-labels">
+          {legend.labels.map((label) => <span key={label}>{label}</span>)}
+        </div>
+      </section>
 
-      {weather && frame && (
-        <section className="timeline">
-          <div className="timeline-top">
+      <section className="timeline-panel" aria-label="Weather timeline">
+        <div className="timeline-top">
+          <div>
+            <div className="timeline-date">{timelineLabel}</div>
+            <div className="timeline-subtitle">
+              {frame ? `Frame ${frameIndex + 1} of ${frames.length}` : "No frame loaded"}
+            </div>
+          </div>
+
+          <div className="timeline-actions">
+            <button
+              className="control-button"
+              onClick={() => moveFrame(-1)}
+              disabled={!frames.length}
+              title="Previous frame"
+              aria-label="Previous frame"
+            >
+              ‹
+            </button>
             <button
               className="play-button"
-              onClick={() => setPlaying(v => !v)}
+              onClick={() => setPlaying((value) => !value)}
+              disabled={!frames.length}
+              title={playing ? "Pause animation" : "Play animation"}
               aria-label={playing ? "Pause animation" : "Play animation"}
             >
               {playing ? "Ⅱ" : "▶"}
             </button>
-
-            <div className="time-readout">
-              <strong>{frame.time} <small>UTC</small></strong>
-              <span>{weather.date} · ERA5</span>
-            </div>
-
-            <select
-              aria-label="Playback speed"
-              value={speed}
-              onChange={e => setSpeed(Number(e.target.value))}
+            <button
+              className="control-button"
+              onClick={() => moveFrame(1)}
+              disabled={!frames.length}
+              title="Next frame"
+              aria-label="Next frame"
             >
-              <option value={1400}>0.5×</option>
-              <option value={800}>1×</option>
-              <option value={400}>2×</option>
-            </select>
-
-            <select
-              className="date-select"
-              aria-label="Choose date"
-              value={weather.date}
-              onChange={e => chooseDate(dates.indexOf(e.target.value))}
-            >
-              {dates.map(d => <option key={d} value={d}>{d}</option>)}
-            </select>
+              ›
+            </button>
           </div>
+        </div>
 
-          <input
-            className="time-slider"
-            type="range"
-            min={0}
-            max={Math.max(0, weather.frames.length - 1)}
-            value={frameIndex}
-            onChange={e => {
-              setPlaying(false);
-              setFrameIndex(Number(e.target.value));
-            }}
-          />
+        <input
+          className="timeline-slider"
+          type="range"
+          min="0"
+          max={Math.max(0, frames.length - 1)}
+          step="1"
+          value={sliderValue}
+          disabled={!frames.length}
+          onChange={(event) => setFrameIndex(Number(event.target.value))}
+          aria-label="Weather forecast time"
+        />
 
-          <div className="time-ticks">
-            {weather.frames.map((f, i) => (
-              <button
-                key={f.time}
-                className={i === frameIndex ? "current" : ""}
-                onClick={() => {
-                  setPlaying(false);
-                  setFrameIndex(i);
-                }}
-              >
-                {f.time}
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
+        <div className="timeline-bottom">
+          <span>{frames[0]?.time || "--:--"}</span>
+          <span>{frame?.time || "--:--"}</span>
+          <span>{frames[frames.length - 1]?.time || "--:--"}</span>
+        </div>
+
+        {error && <div className="error-message">{error}</div>}
+      </section>
     </main>
   );
 }

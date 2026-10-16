@@ -1,36 +1,362 @@
 
-body {
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
   margin: 0;
-  font-family: Arial, sans-serif;
-  background: #0b1220;
-  color: white;
+  overflow: hidden;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-main {
-  max-width: 900px;
-  margin: 40px auto;
-  padding: 20px;
-}
-
-input, button {
-  padding: 10px;
-  margin: 10px 5px;
-  border-radius: 6px;
+button,
+input {
+  font: inherit;
 }
 
 button {
   cursor: pointer;
-  background: #38bdf8;
-  border: none;
 }
 
-article {
-  background: #172338;
-  padding: 15px;
-  margin: 15px 0;
-  border-radius: 8px;
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 
-.error {
-  color: #ff7777;
+.nfd-app {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 400px;
+  overflow: hidden;
+  background: #dce5e8;
+  color: #17232b;
+}
+
+.weather-map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.weather-map .maplibregl-canvas {
+  outline: none;
+}
+
+.layer-toolbar {
+  position: absolute;
+  top: 18px;
+  left: 16px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.layer-button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 70px;
+  min-height: 66px;
+  padding: 8px 4px;
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.91);
+  color: #34444d;
+  box-shadow: 0 3px 14px rgba(20, 40, 50, 0.12);
+  backdrop-filter: blur(10px);
+  transition: background 150ms ease, transform 150ms ease;
+}
+
+.layer-button:hover {
+  transform: translateY(-1px);
+  background: #fff;
+}
+
+.layer-button.active {
+  border-color: #152e3b;
+  background: #172f3d;
+  color: white;
+}
+
+.layer-symbol {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  font-size: 23px;
+  font-weight: 700;
+}
+
+.layer-label {
+  font-size: 10px;
+  line-height: 1.1;
+  text-align: center;
+}
+
+.map-status {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.91);
+  box-shadow: 0 3px 14px rgba(20, 40, 50, 0.10);
+  color: #2c414c;
+  font-size: 12px;
+  backdrop-filter: blur(10px);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: #21a56c;
+}
+
+.status-dot.loading {
+  background: #e5a326;
+  animation: pulse 900ms infinite alternate;
+}
+
+.source-name {
+  padding-left: 8px;
+  border-left: 1px solid #d5dde1;
+  color: #6b7b83;
+}
+
+.legend-panel {
+  position: absolute;
+  right: 18px;
+  bottom: 160px;
+  z-index: 4;
+  width: min(280px, calc(100vw - 36px));
+  padding: 13px 15px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.93);
+  box-shadow: 0 4px 20px rgba(20, 40, 50, 0.13);
+  backdrop-filter: blur(12px);
+}
+
+.legend-heading,
+.legend-heading > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.legend-heading strong {
+  font-size: 13px;
+}
+
+.legend-heading span,
+.legend-heading small {
+  color: #667781;
+  font-size: 11px;
+}
+
+.legend-gradient {
+  height: 9px;
+  margin-top: 14px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    #141fa6 0%,
+    #00bff2 25%,
+    #26cc40 50%,
+    #ffda13 75%,
+    #d90d0d 100%
+  );
+}
+
+.legend-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  margin-top: 6px;
+  color: #53656e;
+  font-size: 10px;
+}
+
+.timeline-panel {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  left: 18px;
+  z-index: 5;
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 15px 18px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  border-radius: 15px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 5px 24px rgba(20, 40, 50, 0.15);
+  backdrop-filter: blur(14px);
+}
+
+.timeline-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+}
+
+.timeline-date {
+  color: #1e303a;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.timeline-subtitle {
+  margin-top: 4px;
+  color: #75858c;
+  font-size: 11px;
+}
+
+.timeline-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.control-button,
+.play-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid #dce3e6;
+  border-radius: 50%;
+  background: #fff;
+  color: #344b56;
+  font-size: 22px;
+}
+
+.play-button {
+  width: 42px;
+  height: 42px;
+  border-color: #172f3d;
+  background: #172f3d;
+  color: white;
+  font-size: 14px;
+}
+
+.timeline-slider {
+  display: block;
+  width: 100%;
+  height: 18px;
+  margin: 12px 0 0;
+  accent-color: #177b9d;
+  cursor: pointer;
+}
+
+.timeline-bottom {
+  display: flex;
+  justify-content: space-between;
+  color: #71818a;
+  font-size: 10px;
+}
+
+.error-message {
+  margin-top: 8px;
+  color: #b3261e;
+  font-size: 12px;
+}
+
+.maplibregl-ctrl-bottom-right {
+  bottom: 150px;
+}
+
+.maplibregl-ctrl-group {
+  overflow: hidden;
+  border-radius: 10px !important;
+  box-shadow: 0 3px 12px rgba(20, 40, 50, 0.12) !important;
+}
+
+@keyframes pulse {
+  from { opacity: 0.45; }
+  to { opacity: 1; }
+}
+
+@media (max-width: 600px) {
+  .layer-toolbar {
+    top: 12px;
+    left: 10px;
+    gap: 7px;
+  }
+
+  .layer-button {
+    width: 59px;
+    min-height: 59px;
+    border-radius: 11px;
+  }
+
+  .layer-symbol {
+    font-size: 20px;
+  }
+
+  .layer-label {
+    font-size: 9px;
+  }
+
+  .map-status {
+    top: 12px;
+    right: 10px;
+    max-width: calc(100vw - 90px);
+    font-size: 10px;
+  }
+
+  .source-name {
+    display: none;
+  }
+
+  .legend-panel {
+    right: 10px;
+    bottom: 165px;
+    width: 210px;
+    padding: 10px 11px;
+  }
+
+  .timeline-panel {
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    padding: 12px;
+  }
+
+  .timeline-date {
+    font-size: 12px;
+  }
+
+  .control-button {
+    width: 32px;
+    height: 32px;
+  }
+
+  .play-button {
+    width: 38px;
+    height: 38px;
+  }
+
+  .maplibregl-ctrl-bottom-right {
+    bottom: 250px;
+  }
 }
