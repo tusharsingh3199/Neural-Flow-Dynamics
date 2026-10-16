@@ -1,4 +1,3 @@
-
 const FIELD_CONFIG = {
   temperature: { key: "t2m", min: -60, max: 45, convert: v => v - 273.15 },
   wind: { key: "wind_speed", min: 0, max: 40, convert: v => v },
@@ -14,6 +13,7 @@ const FIELD_ALIASES = {
 };
 
 const EARTH_CIRCUMFERENCE = 40075016.686;
+const PARTICLE_SPEED_SCALE = 150000; // visual speed-up; tune to taste
 
 function normalizeFieldName(name) {
   return FIELD_ALIASES[String(name || "temperature").toLowerCase()] || "temperature";
@@ -414,6 +414,8 @@ export default class WebGLWeatherLayer {
 
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.grid.cols, this.grid.rows, 0,
       gl.RGBA, gl.UNSIGNED_BYTE, rgba);
 
@@ -481,9 +483,9 @@ export default class WebGLWeatherLayer {
 
       if (wind) {
         const cosLat = Math.max(0.15, Math.cos(wind.lat * Math.PI / 180));
-        p.x = (p.x + wind.u * dt / (EARTH_CIRCUMFERENCE * cosLat) + 1) % 1;
+        p.x = (p.x + wind.u * dt * PARTICLE_SPEED_SCALE / (EARTH_CIRCUMFERENCE * cosLat) + 1) % 1;
         p.y = Math.max(0.001, Math.min(0.999,
-          p.y - wind.v * dt / (EARTH_CIRCUMFERENCE * cosLat)));
+          p.y - wind.v * dt * PARTICLE_SPEED_SCALE / (EARTH_CIRCUMFERENCE * cosLat)));
       }
 
       if (!wind || Math.random() < 0.002) {
@@ -503,12 +505,18 @@ export default class WebGLWeatherLayer {
     gl.uniformMatrix4fv(this.particleLocations.matrix, false, matrix);
     gl.uniform1f(this.particleLocations.size, 2.0);
     gl.drawArrays(gl.POINTS, 0, this.particles.length);
+    gl.disableVertexAttribArray(this.particleLocations.pos);
   }
 
   
-  render(gl, { modelViewProjectionMatrix } = {}) {
-    if (!gl || !this.ready || !this.mesh || !this.weather || !modelViewProjectionMatrix) return;
-    if (modelViewProjectionMatrix.length !== 16) return;
+  render(gl, args = {}) {
+    // IMPORTANT: this layer's vertices are 0..1 Mercator coordinates.
+    // In MapLibre, `defaultProjectionData.mainMatrix` is the matrix for that space.
+    // `modelViewProjectionMatrix` expects world-pixel units (0..worldSize), which
+    // shrinks the mesh to a sub-pixel speck, so nothing visible is drawn.
+    const matrix = args.defaultProjectionData?.mainMatrix;
+    if (!gl || !this.ready || !this.mesh || !this.weather || !matrix) return;
+    if (matrix.length !== 16) return;
 
     const w = this.mesh.positions?.length / 4;
     const count = this.mesh.count;
@@ -557,11 +565,13 @@ export default class WebGLWeatherLayer {
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.uniform1i(loc.field, 0);
     gl.uniform1f(loc.alpha, this.alpha);
-    gl.uniformMatrix4fv(loc.matrix, false, modelViewProjectionMatrix);
+    gl.uniformMatrix4fv(loc.matrix, false, matrix);
 
     const beforeDraw = gl.getError();
     gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_INT, 0);
     const afterDraw = gl.getError();
+    gl.disableVertexAttribArray(loc.pos);
+    gl.disableVertexAttribArray(loc.uv);
 
     if (!this._drawLogged) {
       this._drawLogged = true;
@@ -570,7 +580,7 @@ export default class WebGLWeatherLayer {
         indexCount: count,
         positionAttribute: loc.pos,
         uvAttribute: loc.uv,
-        matrixLength: modelViewProjectionMatrix.length,
+        matrixLength: matrix.length,
         alpha: this.alpha,
         beforeDraw,
         afterDraw,
@@ -585,7 +595,7 @@ export default class WebGLWeatherLayer {
       : 0;
     this.lastParticleTime = now;
 
-    this.renderParticles(gl, modelViewProjectionMatrix, deltaSeconds);
+    this.renderParticles(gl, matrix, deltaSeconds);
 
     if (this.showWind && this.windU && this.windV) {
       this.map?.triggerRepaint();
