@@ -1,0 +1,36 @@
+
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #0b1220;
+  color: white;
+}
+
+main {
+  max-width: 900px;
+  margin: 40px auto;
+  padding: 20px;
+}
+
+input, button {
+  padding: 10px;
+  margin: 10px 5px;
+  border-radius: 6px;
+}
+
+button {
+  cursor: pointer;
+  background: #38bdf8;
+  border: none;
+}
+
+article {
+  background: #172338;
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 8px;
+}
+
+.error {
+  color: #ff7777;
+}
