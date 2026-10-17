@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import WeatherMap from "./WeatherMap";
+import { COLOR_SCALES, encode, legendGradient } from "./Colorscales";
 import "./App.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "";
@@ -14,12 +15,6 @@ const ICONS = {
 };
 const LAYERS = ["temperature", "wind", "pressure", "rainfall"];
 
-const LEGENDS = {
-  temperature: { unit: "°C", ticks: ["-60", "0", "45"] },
-  wind: { unit: "m/s", ticks: ["0", "20", "40"] },
-  pressure: { unit: "hPa", ticks: ["870", "975", "1080"] },
-  rainfall: { unit: "mm", ticks: ["0", "25", "50"] },
-};
 
 const shortDate = d => new Date(`${d}T00:00:00`).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 
@@ -121,7 +116,7 @@ export default function App() {
     return () => clearInterval(id);
   }, [playing, slots, goTo, fetchDate]);
 
-  const legend = LEGENDS[layer];
+  const scale = COLOR_SCALES[layer];
   const dayStarts = slots.map((s, i) => (s.idx === 0 && i > 0 ? i : null)).filter(i => i !== null);
   const pct = i => (slots.length > 1 ? (i / (slots.length - 1)) * 100 : 0);
 
@@ -138,9 +133,13 @@ export default function App() {
       </div>
 
       <div className="legend">
-        <div className={`bar ${layer}`} />
+        <div className="bar" style={{ background: legendGradient(scale) }} />
         <div className="ticks">
-          {legend.ticks.map((t, i) => <span key={t}>{t}{i === 2 ? ` ${legend.unit}` : ""}</span>)}
+          {scale.ticks.map((v, i) => (
+            <span key={v} style={{ left: `${encode(v, scale) * 100}%` }}>
+              {v}{i === scale.ticks.length - 1 ? ` ${scale.unit}` : ""}
+            </span>
+          ))}
         </div>
       </div>
 

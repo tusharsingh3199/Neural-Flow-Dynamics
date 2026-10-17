@@ -15,9 +15,10 @@ button:hover { background: rgba(255, 255, 255, .1); color: #fff; }
 button.on { background: #2f7cf6; color: #fff; }
 svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
-.legend { left: 8px; bottom: 8px; width: 104px; padding: 5px 7px 4px; }
-.bar { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #1420a6, #00bff2 25%, #26cc40 50%, #ffd90d 75%, #d90d0d); }
-.ticks { display: flex; justify-content: space-between; margin-top: 3px; font-size: 9px; color: #aab4c2; }
+.legend { left: 8px; bottom: 8px; width: 124px; padding: 5px 7px 4px; }
+.bar { height: 7px; border-radius: 3px; }
+.ticks { position: relative; height: 11px; margin-top: 3px; font-size: 9px; color: #aab4c2; }
+.ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
 
 .timeline { left: 50%; bottom: 8px; transform: translateX(-50%); width: min(520px, calc(100% - 270px)); display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 4px; }
 .track { position: relative; flex: 1; height: 24px; display: flex; align-items: center; }

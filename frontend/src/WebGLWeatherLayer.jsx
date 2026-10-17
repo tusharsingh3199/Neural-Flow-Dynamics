@@ -1,8 +1,11 @@
+import { COLOR_SCALES, buildLut, encode } from "./Colorscales";
+
 const FIELD_CONFIG = {
-  temperature: { key: "t2m", min: -60, max: 45, convert: v => v - 273.15 },
-  wind: { key: "wind_speed", min: 0, max: 40, convert: v => v },
-  pressure: { key: "sp", min: 870, max: 1080, convert: v => v / 100 },
-  rainfall: { key: "tp", min: 0, max: 50, convert: v => v * 1000 },
+  temperature: { key: "t2m", convert: v => v - 273.15 },
+  wind: { key: "wind_speed", convert: v => v },
+  // Prefers mean-sea-level pressure ("msl"); falls back to surface pressure ("sp").
+  pressure: { key: "msl", fallback: "sp", convert: v => v / 100 },
+  rainfall: { key: "tp", convert: v => v * 1000 },
 };
 
 const FIELD_ALIASES = {
@@ -171,18 +174,11 @@ const WEATHER_FRAGMENT = `#version 300 es
 precision highp float;
 uniform sampler2D u_a;
 uniform sampler2D u_b;
+uniform sampler2D u_lut;
 uniform float u_mix;
 uniform float u_alpha;
 in vec2 v_uv;
 out vec4 fragColor;
-
-vec3 ramp(float t) {
-  t = clamp(t, 0.0, 1.0);
-  if (t < 0.25) return mix(vec3(0.08,0.12,0.65), vec3(0.0,0.75,0.95), t/0.25);
-  if (t < 0.50) return mix(vec3(0.0,0.75,0.95), vec3(0.15,0.8,0.25), (t-0.25)/0.25);
-  if (t < 0.75) return mix(vec3(0.15,0.8,0.25), vec3(1.0,0.85,0.05), (t-0.50)/0.25);
-  return mix(vec3(1.0,0.85,0.05), vec3(0.85,0.05,0.05), (t-0.75)/0.25);
-}
 
 void main() {
   vec4 a = texture(u_a, v_uv);
@@ -190,8 +186,10 @@ void main() {
   if (a.a < 0.5 && b.a < 0.5) discard;
   float va = a.a > 0.5 ? a.r : b.r;
   float vb = b.a > 0.5 ? b.r : a.r;
-  float alpha = clamp(u_alpha, 0.0, 1.0);
-  fragColor = vec4(ramp(mix(va, vb, u_mix)) * alpha, alpha);
+  float t = clamp(mix(va, vb, u_mix), 0.0, 1.0);
+  vec4 c = texture(u_lut, vec2(t * (255.0 / 256.0) + 0.5 / 256.0, 0.5));
+  float al = c.a * clamp(u_alpha, 0.0, 1.0);
+  fragColor = vec4(c.rgb * al, al);
 }`;
 
 // Each particle is drawn as TRAIL_LENGTH fading points, which forms a streak.
@@ -240,8 +238,8 @@ export default class WebGLWeatherLayer {
     this.id = options.id || "nfd-weather-webgl";
     this.type = "custom";
     this.renderingMode = "2d";
-    this.alpha = options.alpha ?? 0.7;
-    this.particleCount = options.particleCount ?? 4500;
+    this.alpha = options.alpha ?? 0.8;
+    this.particleCount = options.particleCount ?? 5000;
     this.ready = false;
     this.map = null;
     this.gl = null;
@@ -250,6 +248,7 @@ export default class WebGLWeatherLayer {
     this.want = { coords: null, frame: null, layer: "temperature" };
     this.applied = { coords: null, frame: null, layer: null };
     this.hasField = false;
+    this.activeLayer = "temperature";
     this.mix = 0;
     this.transition = null;
     this.windA = null; // { u, v } for the visible frame
@@ -268,7 +267,7 @@ export default class WebGLWeatherLayer {
       this.wLoc = {
         matrix: gl.getUniformLocation(w, "u_matrix"), a: gl.getUniformLocation(w, "u_a"),
         b: gl.getUniformLocation(w, "u_b"), mix: gl.getUniformLocation(w, "u_mix"),
-        alpha: gl.getUniformLocation(w, "u_alpha"),
+        alpha: gl.getUniformLocation(w, "u_alpha"), lut: gl.getUniformLocation(w, "u_lut"),
         pos: gl.getAttribLocation(w, "a_pos"), uv: gl.getAttribLocation(w, "a_uv"),
       };
       this.pLoc = {
@@ -281,6 +280,15 @@ export default class WebGLWeatherLayer {
       this.fadeBuffer = gl.createBuffer();
       this.texA = makeTexture(gl);
       this.texB = makeTexture(gl);
+      this.luts = {};
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      for (const name of Object.keys(COLOR_SCALES)) {
+        const tex = makeTexture(gl);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, buildLut(COLOR_SCALES[name]));
+        this.luts[name] = tex;
+      }
       this.ready = true;
       this.sync();
     } catch (error) {
@@ -309,16 +317,17 @@ export default class WebGLWeatherLayer {
       this.applied.frame = null;
     }
     if (this.grid && frame && (frame !== this.applied.frame || layer !== this.applied.layer)) {
+      const sameLayer = layer === this.applied.layer;
       this.applied.frame = frame;
       this.applied.layer = layer;
-      this.loadField(frame, layer);
+      this.loadField(frame, layer, sameLayer);
     }
     this.map?.triggerRepaint();
   }
 
   fieldValues(frame, name) {
     const config = FIELD_CONFIG[name];
-    let raw = frame[config.key];
+    let raw = frame[config.key] ?? (config.fallback ? frame[config.fallback] : undefined);
     if (name === "wind" && raw == null) {
       const u = flattenGrid(frame.u10), v = flattenGrid(frame.v10);
       raw = u.map((x, i) => Math.hypot(Number(x), Number(v[i])));
@@ -330,16 +339,15 @@ export default class WebGLWeatherLayer {
     return out;
   }
 
-  loadField(frame, name) {
+  loadField(frame, name, animate = true) {
     const gl = this.gl;
     const values = this.fieldValues(frame, name);
     if (!values) return;
-    const config = FIELD_CONFIG[name];
+    const scale = COLOR_SCALES[name];
     const rgba = new Uint8Array(values.length * 4);
     for (let i = 0; i < values.length; i++) {
       if (!Number.isFinite(values[i])) continue;
-      const t = Math.max(0, Math.min(1, (values[i] - config.min) / (config.max - config.min)));
-      rgba[i * 4] = Math.round(t * 255);
+      rgba[i * 4] = Math.round(encode(values[i], scale) * 255);
       rgba[i * 4 + 3] = 255;
     }
     if (this.transition) this.finishTransition(); // never stack transitions
@@ -354,8 +362,9 @@ export default class WebGLWeatherLayer {
     this.windB = u.length && u.length === v.length
       ? { u: reorderGrid(u, this.grid), v: reorderGrid(v, this.grid) } : null;
 
-    if (!this.hasField) {
-      this.finishTransition(); // first frame: show immediately
+    this.activeLayer = name;
+    if (!animate || !this.hasField) {
+      this.finishTransition(); // first frame or layer switch: show immediately
       this.hasField = true;
     } else {
       this.transition = { start: performance.now() };
@@ -490,7 +499,10 @@ export default class WebGLWeatherLayer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.texB);
     gl.uniform1i(loc.a, 0);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.luts[this.activeLayer]);
     gl.uniform1i(loc.b, 1);
+    gl.uniform1i(loc.lut, 2);
     gl.uniform1f(loc.mix, this.transition ? this.mix : 0);
     gl.uniform1f(loc.alpha, this.alpha);
     gl.uniformMatrix4fv(loc.matrix, false, matrix);
@@ -511,7 +523,7 @@ export default class WebGLWeatherLayer {
     const gl = this.gl;
     if (gl) {
       [this.positionBuffer, this.indexBuffer, this.particleBuffer, this.fadeBuffer].forEach(b => b && gl.deleteBuffer(b));
-      [this.texA, this.texB].forEach(t => t && gl.deleteTexture(t));
+      [this.texA, this.texB, ...Object.values(this.luts || {})].forEach(t => t && gl.deleteTexture(t));
       [this.weatherProgram, this.particleProgram].forEach(p => p && gl.deleteProgram(p));
     }
     this.map = this.gl = this.mesh = this.grid = null;
