@@ -1,3 +1,4 @@
+
 import { useEffect, useRef } from "react";
 import * as maplibregl from "maplibre-gl";
 import { setWorkerUrl } from "maplibre-gl";
@@ -7,16 +8,16 @@ import WebGLWeatherLayer from "./WebGLWeatherLayer";
 
 setWorkerUrl(workerUrl);
 
-export default function WeatherMap({ coords, frame, layer }) {
+export default function WeatherMap({ coords, frame, layer, showWind }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const layerRef = useRef(null);
-  const latest = useRef({ coords, frame, layer });
+  const latest = useRef({ coords, frame, layer, showWind });
 
   useEffect(() => {
-    latest.current = { coords, frame, layer };
-    layerRef.current?.update(coords, frame, layer, layer === "wind");
-  }, [coords, frame, layer]);
+    latest.current = { coords, frame, layer, showWind };
+    layerRef.current?.update(coords, frame, layer, showWind);
+  }, [coords, frame, layer, showWind]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -37,12 +38,16 @@ export default function WeatherMap({ coords, frame, layer }) {
             type: "raster",
             tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
             tileSize: 256,
-            attribution:
-              '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-          },
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          }
         },
-        layers: [{ id: "osm-base", type: "raster", source: "osm", paint: { "raster-fade-duration": 0 } }],
-      },
+        layers: [{
+          id: "osm-base",
+          type: "raster",
+          source: "osm",
+          paint: { "raster-fade-duration": 0 }
+        }]
+      }
     });
 
     const weatherLayer = new WebGLWeatherLayer();
@@ -53,8 +58,9 @@ export default function WeatherMap({ coords, frame, layer }) {
     map.on("load", () => {
       map.addLayer(weatherLayer);
       const l = latest.current;
-      weatherLayer.update(l.coords, l.frame, l.layer, l.layer === "wind");
+      weatherLayer.update(l.coords, l.frame, l.layer, l.showWind);
     });
+
     map.on("error", e => console.warn("[NFD] MapLibre error:", e.error?.message || e.error));
 
     return () => {

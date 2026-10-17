@@ -36,6 +36,25 @@ function flattenGrid(value) {
   return value.flat(Infinity);
 }
 
+function getBinaryField(frame, key) {
+  const { data, metadata } = frame || {};
+  if (!data || !metadata?.variables || !metadata?.shape) return null;
+
+  const variableIndex = metadata.variables.indexOf(key);
+  if (variableIndex < 0) return null;
+
+  const [timeCount, variableCount, rows, cols] = metadata.shape;
+  const timeIndex = frame.timeIndex ?? 0;
+
+  if (
+    timeIndex < 0 || timeIndex >= timeCount ||
+    variableCount !== metadata.variables.length
+  ) return null;
+
+  const start = (timeIndex * variableCount + variableIndex) * rows * cols;
+  return data.subarray(start, start + rows * cols);
+}
+
 function findArray(objects, keys) {
   for (const obj of objects) {
     if (!obj || typeof obj !== "object") continue;
@@ -163,10 +182,11 @@ precision highp float;
 in vec2 a_pos;
 in vec2 a_uv;
 uniform mat4 u_matrix;
+uniform float u_offset;
 out vec2 v_uv;
 void main() {
   v_uv = a_uv;
-  gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
+  gl_Position = u_matrix * vec4(a_pos.x + u_offset, a_pos.y, 0.0, 1.0);
 }`;
 
 // Cross-fades between two field textures (u_a -> u_b) on the GPU.
@@ -198,11 +218,13 @@ precision highp float;
 in vec2 a_pos;
 in float a_fade;
 uniform mat4 u_matrix;
+uniform float u_offset;
 uniform float u_size;
 out float v_fade;
 void main() {
   v_fade = a_fade;
   gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
+  gl_Position = u_matrix * vec4(a_pos.x + u_offset, a_pos.y, 0.0, 1.0);
   gl_PointSize = u_size * (0.3 + 0.7 * a_fade);
 }`;
 
@@ -269,10 +291,12 @@ export default class WebGLWeatherLayer {
         b: gl.getUniformLocation(w, "u_b"), mix: gl.getUniformLocation(w, "u_mix"),
         alpha: gl.getUniformLocation(w, "u_alpha"), lut: gl.getUniformLocation(w, "u_lut"),
         pos: gl.getAttribLocation(w, "a_pos"), uv: gl.getAttribLocation(w, "a_uv"),
+        offset: gl.getUniformLocation(w, "u_offset"),
       };
       this.pLoc = {
         matrix: gl.getUniformLocation(p, "u_matrix"), size: gl.getUniformLocation(p, "u_size"),
         pos: gl.getAttribLocation(p, "a_pos"), fade: gl.getAttribLocation(p, "a_fade"),
+        offset: gl.getUniformLocation(p, "u_offset"),
       };
       this.positionBuffer = gl.createBuffer();
       this.indexBuffer = gl.createBuffer();
@@ -327,15 +351,34 @@ export default class WebGLWeatherLayer {
 
   fieldValues(frame, name) {
     const config = FIELD_CONFIG[name];
+    const binary = getBinaryField(frame, config.key)
+      ?? (config.fallback ? getBinaryField(frame, config.fallback) : null);
+
+    if (binary) {
+      const grid = reorderGrid(binary, this.grid);
+      if (!grid) return null;
+
+      for (let i = 0; i < grid.length; i++) {
+        grid[i] = Number.isFinite(grid[i]) ? config.convert(grid[i]) : NaN;
+      }
+      return grid;
+    }
+
     let raw = frame[config.key] ?? (config.fallback ? frame[config.fallback] : undefined);
+
     if (name === "wind" && raw == null) {
-      const u = flattenGrid(frame.u10), v = flattenGrid(frame.v10);
+      const u = flattenGrid(frame.u10);
+      const v = flattenGrid(frame.v10);
       raw = u.map((x, i) => Math.hypot(Number(x), Number(v[i])));
     }
+
     const grid = reorderGrid(flattenGrid(raw), this.grid);
     if (!grid) return null;
+
     const out = new Float32Array(grid.length);
-    for (let i = 0; i < grid.length; i++) out[i] = Number.isFinite(grid[i]) ? config.convert(grid[i]) : NaN;
+    for (let i = 0; i < grid.length; i++) {
+      out[i] = Number.isFinite(grid[i]) ? config.convert(grid[i]) : NaN;
+    }
     return out;
   }
 
@@ -358,7 +401,9 @@ export default class WebGLWeatherLayer {
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.grid.cols, this.grid.rows, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
 
-    const u = flattenGrid(frame.u10), v = flattenGrid(frame.v10);
+    const u = getBinaryField(frame, "u10") ?? flattenGrid(frame.u10);
+    const v = getBinaryField(frame, "v10") ?? flattenGrid(frame.v10);
+
     this.windB = u.length && u.length === v.length
       ? { u: reorderGrid(u, this.grid), v: reorderGrid(v, this.grid) } : null;
 
@@ -405,12 +450,19 @@ export default class WebGLWeatherLayer {
     let x0 = 0, x1 = 1, y0 = 0.02, y1 = 0.98;
     if (this.map) {
       const b = this.map.getBounds();
-      const west = mercatorX(b.getWest()), east = mercatorX(b.getEast());
-      if (east > west) { x0 = Math.max(0, west); x1 = Math.min(1, east); }
+
+      const span = b.getEast() - b.getWest();
+      if (span < 360) {
+        x0 = ((mercatorX(b.getWest()) % 1) + 1) % 1;
+        x1 = x0 + span / 360; 
+      }
+
+      //const west = mercatorX(b.getWest()), east = mercatorX(b.getEast());
+      //if (east > west) { x0 = Math.max(0, west); x1 = Math.min(1, east); }
       y0 = Math.max(0.001, mercatorY(b.getNorth()));
       y1 = Math.min(0.999, mercatorY(b.getSouth()));
     }
-    p.x = x0 + Math.random() * (x1 - x0);
+    p.x = (x0 + Math.random() * (x1 - x0)) % 1;
     p.y = y0 + Math.random() * (y1 - y0);
     p.age = 0;
     p.life = 80 + Math.random() * 120;
@@ -463,8 +515,11 @@ export default class WebGLWeatherLayer {
     gl.enableVertexAttribArray(this.pLoc.fade);
     gl.vertexAttribPointer(this.pLoc.fade, 1, gl.FLOAT, false, 0, 0);
     gl.uniformMatrix4fv(this.pLoc.matrix, false, matrix);
-    gl.uniform1f(this.pLoc.size, 2.4 * (window.devicePixelRatio || 1));
-    gl.drawArrays(gl.POINTS, 0, this.particles.length * TRAIL_LENGTH);
+    gl.uniform1f(this.pLoc.size, 3.4 * (window.devicePixelRatio || 1));
+    for (let o = this.copyFirst; o <= this.copyLast; o++) {
+      gl.uniform1f(this.pLoc.offset, o);
+      gl.drawArrays(gl.POINTS, 0, this.particles.length * TRAIL_LENGTH);
+    }
     gl.disableVertexAttribArray(this.pLoc.pos);
     gl.disableVertexAttribArray(this.pLoc.fade);
   }
@@ -506,7 +561,13 @@ export default class WebGLWeatherLayer {
     gl.uniform1f(loc.mix, this.transition ? this.mix : 0);
     gl.uniform1f(loc.alpha, this.alpha);
     gl.uniformMatrix4fv(loc.matrix, false, matrix);
-    gl.drawElements(gl.TRIANGLES, this.mesh.count, gl.UNSIGNED_INT, 0);
+    const bnd = this.map.getBounds();
+    this.copyFirst = Math.floor((bnd.getWest() + 180) / 360);
+    this.copyLast = Math.floor((bnd.getEast() + 180) / 360);
+    for (let o = this.copyFirst; o <= this.copyLast; o++) {
+      gl.uniform1f(loc.offset, o);
+      gl.drawElements(gl.TRIANGLES, this.mesh.count, gl.UNSIGNED_INT, 0);
+    }
     gl.disableVertexAttribArray(loc.pos);
     gl.disableVertexAttribArray(loc.uv);
     gl.activeTexture(gl.TEXTURE0);

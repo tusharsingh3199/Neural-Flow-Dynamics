@@ -430,8 +430,7 @@ export default function WeatherLayer({
       }
 
       drawField();
-
-      if (field === "wind_speed" && showWind && frame.u10 && frame.v10) {
+      if (field === "wind_speed" && showWind && frame.u10 && frame.v10_) {
         seedParticles();
         ctx.clearRect(0, 0, map.getSize().x, map.getSize().y);
         drawField();
