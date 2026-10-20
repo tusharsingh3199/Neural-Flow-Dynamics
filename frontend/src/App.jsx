@@ -17,29 +17,28 @@ const ICONS = {
 
 const shortDate = d => new Date(`${d}T00:00:00`).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 
-async function fetchWeatherBinary(date) {
-  const r = await fetch(`${API_BASE}/api/weather-binary?date=${encodeURIComponent(date)}`);
+async function fetchWeatherBinary(date, isForecast, run) {
+  const endpoint = isForecast
+    ? `/api/forecast-binary?date=${encodeURIComponent(date)}&run=${encodeURIComponent(run)}`
+    : `/api/weather-binary?date=${encodeURIComponent(date)}`;
+  const r = await fetch(`${API_BASE}${endpoint}`);
   if (!r.ok) throw new Error(`Weather request failed (${r.status})`);
   const buffer = await r.arrayBuffer();
   if (buffer.byteLength < 4) throw new Error("Invalid weather response");
-
   const headerLength = new DataView(buffer).getUint32(0, true);
-  const headerEnd = 4 + headerLength;
-  const dataStart = Math.ceil(headerEnd / 4) * 4;
+  const headerEnd = 4 + headerLength, dataStart = Math.ceil(headerEnd / 4) * 4;
   if (headerEnd > buffer.byteLength || dataStart > buffer.byteLength) throw new Error("Invalid weather header");
-
   const metadata = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 4, headerLength)));
   const count = metadata.shape.reduce((a, b) => a * b, 1);
   if (buffer.byteLength - dataStart !== count * 4) throw new Error("Invalid weather data size");
-
   return { ...metadata, values: new Float32Array(buffer, dataStart, count) };
 }
 
 function makeFrame(payload, timeIndex) {
   const [, variableCount, height, width] = payload.shape;
   const frame = { time: payload.times[timeIndex] };
-  payload.variables.forEach((name, variableIndex) => {
-    const start = (timeIndex * variableCount + variableIndex) * height * width;
+  payload.variables.forEach((name, vi) => {
+    const start = (timeIndex * variableCount + vi) * height * width;
     const values = payload.values.subarray(start, start + height * width);
     frame[name] = Array.from({ length: height }, (_, y) =>
       Array.from(values.subarray(y * width, (y + 1) * width), v => Number.isFinite(v) ? v : null)
@@ -50,6 +49,8 @@ function makeFrame(payload, timeIndex) {
 
 export default function App() {
   const [dates, setDates] = useState([]);
+  const [forecastDates, setForecastDates] = useState([]);
+  const [forecastRun, setForecastRun] = useState(null);
   const [cache, setCache] = useState({});
   const [coords, setCoords] = useState(null);
   const [slot, setSlot] = useState(0);
@@ -64,30 +65,25 @@ export default function App() {
   const slotRef = useRef(0);
   const datesRef = useRef([]);
   const viewDate = useRef("");
+  const forecastDatesRef = useRef(new Set());
+  const forecastRunRef = useRef(null);
 
   useEffect(() => { cacheRef.current = cache; }, [cache]);
-
-  const slots = useMemo(() => dates.flatMap(date => {
-    const times = cache[date]?.times || DEFAULT_TIMES;
-    return times.map((time, idx) => ({ date, idx, time }));
-  }), [dates, cache]);
-
-  const safeSlot = Math.min(slot, Math.max(0, slots.length - 1));
-  const current = slots[safeSlot];
 
   const fetchDate = useCallback(async date => {
     if (!date || cacheRef.current[date] || inflight.current.has(date)) return;
     inflight.current.add(date);
     try {
-      const payload = await fetchWeatherBinary(date);
-      if (!payload.latitude?.length || !payload.longitude?.length || !payload.shape || payload.shape.length !== 4) {
+      const isForecast = forecastDatesRef.current.has(date);
+      const run = forecastRunRef.current;
+      if (isForecast && !run) throw new Error("Forecast run is unavailable");
+      const payload = await fetchWeatherBinary(date, isForecast, run);
+      if (!payload.latitude?.length || !payload.longitude?.length || !payload.shape || payload.shape.length !== 4)
         throw new Error("Invalid weather grid metadata");
-      }
       setCoords(c => c || payload);
       setCache(prev => {
         const next = { ...prev, [date]: payload };
-        const list = datesRef.current;
-        const vi = list.indexOf(viewDate.current);
+        const list = datesRef.current, vi = list.indexOf(viewDate.current);
         if (vi >= 0) Object.keys(next).forEach(d => {
           if (d !== date && Math.abs(list.indexOf(d) - vi) > 1) delete next[d];
         });
@@ -102,12 +98,16 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API_BASE}/api/dates`)
+    fetch(`${API_BASE}/api/available-dates`)
       .then(r => { if (!r.ok) throw new Error(`Dates request failed (${r.status})`); return r.json(); })
       .then(p => {
         if (cancelled) return;
         const list = (p.dates || []).slice().sort();
         if (!list.length) throw new Error("No data available");
+        forecastDatesRef.current = new Set(p.forecast_dates || []);
+        forecastRunRef.current = p.forecast_run || null;
+        setForecastDates(p.forecast_dates || []);
+        setForecastRun(p.forecast_run || null);
         datesRef.current = list;
         viewDate.current = list[0];
         setDates(list);
@@ -117,6 +117,14 @@ export default function App() {
       .catch(e => { if (!cancelled) setError(e.message); });
     return () => { cancelled = true; };
   }, [fetchDate]);
+
+  const slots = useMemo(() => dates.flatMap(date => {
+    const times = cache[date]?.times || DEFAULT_TIMES;
+    return times.map((time, idx) => ({ date, idx, time }));
+  }), [dates, cache]);
+
+  const safeSlot = Math.min(slot, Math.max(0, slots.length - 1));
+  const current = slots[safeSlot];
 
   const goTo = useCallback(i => {
     const target = slots[i];
@@ -130,17 +138,9 @@ export default function App() {
     if (target.idx <= 1 && datesRef.current[k - 1]) fetchDate(datesRef.current[k - 1]);
   }, [slots, fetchDate]);
 
-  const currentDate = current?.date;
-  const currentIdx = current?.idx;
+  const currentDate = current?.date, currentIdx = current?.idx;
   const currentPayload = currentDate ? cache[currentDate] : null;
-
-  const target = useMemo(
-    () => currentPayload && currentIdx != null
-      ? makeFrame(currentPayload, currentIdx)
-      : null,
-    [currentPayload, currentIdx]
-  );
-
+  const target = useMemo(() => currentPayload && currentIdx != null ? makeFrame(currentPayload, currentIdx) : null, [currentPayload, currentIdx]);
   const displayedFrame = target ?? shown;
   const loading = !!current && !target;
 
@@ -151,14 +151,17 @@ export default function App() {
       if (nextIndex >= slots.length) { setPlaying(false); return; }
       const next = slots[nextIndex];
       if (cacheRef.current[next.date]) goTo(nextIndex);
-      else fetchDate(next.date);
+      else {
+        viewDate.current = next.date;
+        fetchDate(next.date);
+      }
     }, PLAY_MS);
     return () => clearInterval(id);
   }, [playing, slots, goTo, fetchDate]);
 
   const scale = COLOR_SCALES[layer];
   const dayStarts = slots.map((s, i) => s.idx === 0 && i > 0 ? i : null).filter(i => i !== null);
-  const pct = i => slots.length > 1 ? (i / (slots.length - 1)) * 100 : 0;
+  const pct = i => slots.length > 1 ? i / (slots.length - 1) * 100 : 0;
 
   return (
     <div className="nfd-app">
@@ -173,18 +176,12 @@ export default function App() {
           <svg viewBox="0 0 24 24"><path d="M4 12h13M13 7l5 5-5 5" /></svg>
         </button>
       </div>
-
       <div className="legend">
         <div className="bar" style={{ background: legendGradient(scale) }} />
         <div className="ticks">
-          {scale.ticks.map((v, i) => (
-            <span key={v} style={{ left: `${encode(v, scale) * 100}%` }}>
-              {v}{i === scale.ticks.length - 1 ? ` ${scale.unit}` : ""}
-            </span>
-          ))}
+          {scale.ticks.map((v, i) => <span key={v} style={{ left: `${encode(v, scale) * 100}%` }}>{v}{i === scale.ticks.length - 1 ? ` ${scale.unit}` : ""}</span>)}
         </div>
       </div>
-
       {slots.length > 0 && (
         <div className="timeline">
           <button className="play" aria-label={playing ? "pause" : "play"} onClick={() => setPlaying(p => !p)}>
@@ -192,18 +189,12 @@ export default function App() {
           </button>
           <div className="track">
             <div className="ticks-day">{dayStarts.map(i => <i key={i} style={{ left: `${pct(i)}%` }} />)}</div>
-            <input type="range" min={0} max={slots.length - 1} value={safeSlot}
-              onChange={e => { setPlaying(false); goTo(Number(e.target.value)); }}
-              onPointerDown={() => setDragging(true)} onPointerUp={() => setDragging(false)}
-              onPointerCancel={() => setDragging(false)} aria-label="time" />
-            {dragging && current && (
-              <span className="bubble" style={{ left: `${pct(safeSlot)}%` }}>{shortDate(current.date)} {current.time}</span>
-            )}
+            <input type="range" min={0} max={slots.length - 1} value={safeSlot} onChange={e => { setPlaying(false); goTo(Number(e.target.value)); }} onPointerDown={() => setDragging(true)} onPointerUp={() => setDragging(false)} onPointerCancel={() => setDragging(false)} aria-label="time" />
+            {dragging && current && <span className="bubble" style={{ left: `${pct(safeSlot)}%` }}>{shortDate(current.date)} {current.time}</span>}
           </div>
           <span className={`dot ${loading ? "busy" : ""}`} />
         </div>
       )}
-
       {error && <div className="toast" onClick={() => setError("")}>{error}</div>}
     </div>
   );

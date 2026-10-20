@@ -1,14 +1,16 @@
 # command - python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
-from datetime import date
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-import json, struct
+import json, struct, threading, time
 
 import cfgrib
 import numpy as np
 import pandas as pd
 import xarray as xr
+from ecmwf.opendata import Client
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,10 +24,39 @@ VARIABLES = ["u10", "v10", "d2m", "t2m", "sp", "tp", "wind_speed"]
 SOURCE_VARIABLES = VARIABLES[:-1]
 UNITS = {"u10": "m/s", "v10": "m/s", "d2m": "degC", "t2m": "degC", "sp": "hPa", "tp": "mm", "wind_speed": "m/s"}
 
-app = FastAPI(title="Neural Flow Dynamics API", description="Global ERA5 weather data API for NFD.", version="0.2.0")
+# ---------------- Forecast (ECMWF IFS open data) settings ----------------
+FORECAST_DIR = BASE_DIR / "data" / "forecast"
+FORECAST_MAX_STEP = 240                         # 00/12 UTC runs go to 360h, 06/18 only to 144h
+FORECAST_STEPS = list(range(0, FORECAST_MAX_STEP + 1, 6))
+FORECAST_PARAMS = ["10u", "10v", "2d", "2t", "sp", "tp"]
+FORECAST_REFRESH_SECONDS = 1800
+FORECAST_KEEP_RUNS = 2
+
+_ecmwf_client = Client(source="ecmwf", model="ifs", resol="0p25")
+_forecast_lock = threading.Lock()
+_forecast_state = {"run": None, "checked": 0.0}
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # pre-warm the forecast so the first user doesn't wait for the download
+    threading.Thread(target=_safe_warm, daemon=True).start()
+    yield
+
+
+def _safe_warm():
+    try:
+        ensure_latest_forecast()
+    except Exception as exc:
+        print(f"[forecast] warm-up failed: {exc}")
+
+
+app = FastAPI(title="Neural Flow Dynamics API", description="Global ERA5 + ECMWF forecast weather data API for NFD.", version="0.3.0", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=False, allow_methods=["GET"], allow_headers=["*"])
 
+
+# ======================= ERA5 (historical) =======================
 
 @lru_cache(maxsize=1)
 def load_dataset():
@@ -62,7 +93,8 @@ def get_grid(ds, variable, timestamp):
     field = ds[variable].sel(time=timestamp)
     if "step" in field.dims:
         field = field.isel(step=0)
-    return np.asarray(field.squeeze(drop=True).transpose("latitude", "longitude").values)
+    values = np.asarray(field.squeeze(drop=True).transpose("latitude", "longitude").values, dtype=float)
+    return values
 
 
 def get_timestamps_for_date(ds, requested_date):
@@ -81,26 +113,159 @@ def get_frame_arrays(ds, timestamp):
     return [u10, v10, get_grid(ds, "d2m", timestamp), get_grid(ds, "t2m", timestamp), get_grid(ds, "sp", timestamp), get_grid(ds, "tp", timestamp), np.hypot(u10, v10)]
 
 
+def pack_binary(data, times, lat, lon, date_string, **extra):
+    """Shared binary packer: [uint32 header_len][json header][pad to 4][float32 data]."""
+    metadata = {
+        "date": date_string, "source": "ERA5 reanalysis", "variables": VARIABLES,
+        "units": UNITS, "times": times, "expected_times_utc": EXPECTED_TIMES,
+        "shape": list(data.shape), "latitude": lat, "longitude": lon,
+        "dtype": "float32", "byte_order": "little",
+        "layout": "time,variable,latitude,longitude", **extra,
+    }
+    header = json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    padding = b"\0" * (-(4 + len(header)) % 4)
+    body = np.ascontiguousarray(np.asarray(data).astype("<f4", copy=False)).tobytes()
+    return struct.pack("<I", len(header)) + header + padding + body
+
+
 @lru_cache(maxsize=3)
 def build_binary(date_string):
     ds = load_or_http_error()
     timestamps = get_timestamps_for_date(ds, date.fromisoformat(date_string))
     if not timestamps:
         raise HTTPException(status_code=404, detail=f"No weather data found for {date_string}. Check /api/dates.")
-    frames = [np.stack(get_frame_arrays(ds, t), axis=0) for t in timestamps]
-    data = np.ascontiguousarray(np.stack(frames).astype("<f4", copy=False))
-    metadata = {
-        "date": date_string, "source": "ERA5 reanalysis", "variables": VARIABLES,
-        "units": UNITS, "times": [pd.Timestamp(t).strftime("%H:%M") for t in timestamps],
-        "expected_times_utc": EXPECTED_TIMES, "shape": list(data.shape),
-        "latitude": ds.latitude.values.tolist(), "longitude": ds.longitude.values.tolist(),
-        "dtype": "float32", "byte_order": "little",
-        "layout": "time,variable,latitude,longitude"
-    }
-    header = json.dumps(metadata, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    padding = b"\0" * (-(4 + len(header)) % 4)
-    return struct.pack("<I", len(header)) + header + padding + data.tobytes()
+    data = np.stack([np.stack(get_frame_arrays(ds, t), axis=0) for t in timestamps])
+    return pack_binary(data, [pd.Timestamp(t).strftime("%H:%M") for t in timestamps],
+                       ds.latitude.values.tolist(), ds.longitude.values.tolist(), date_string,
+                       kind="reanalysis")
 
+
+def _forecast_npz(run):
+    return FORECAST_DIR / f"ifs_{run}_1deg.npz"
+
+
+def _download_forecast(run_dt):
+    FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+    run = run_dt.strftime("%Y%m%d%H")
+    grib = FORECAST_DIR / f"ifs_{run}.grib2"
+    _ecmwf_client.retrieve(
+        date=run_dt.strftime("%Y-%m-%d"), time=run_dt.hour,
+        type="fc", stream="oper", step=FORECAST_STEPS, param=FORECAST_PARAMS, target=str(grib),
+    )
+    groups = cfgrib.open_datasets(str(grib), backend_kwargs={"indexpath": ""})
+    ds = xr.merge(
+        [g.drop_vars(["heightAboveGround", "surface"], errors="ignore") for g in groups],
+        compat="override", join="outer",
+    )
+    ds = ds.isel(latitude=slice(None, None, 4), longitude=slice(None, None, 4)).load()  # 0.25 deg -> 1 deg
+
+    step_h = (ds.step.values / np.timedelta64(1, "h")).astype(int)
+    g = lambda v: ds[v].transpose("step", "latitude", "longitude").values.astype("float32")
+
+    u10, v10 = g("u10"), g("v10")
+    d2m, t2m = g("d2m") - 273.15, g("t2m") - 273.15                            
+    sp = g("sp") / 100.0                                                     
+    acc = np.nan_to_num(g("tp"))                                             
+    tp = np.clip(np.diff(acc, axis=0, prepend=acc[:1]), 0, None) * 1000  
+
+    print("d2m Celsius range:", np.nanmin(d2m), np.nanmax(d2m))
+    print("t2m Celsius range:", np.nanmin(t2m), np.nanmax(t2m))
+    print("sp hPa range:", np.nanmin(sp), np.nanmax(sp))
+    print("Raw tp range (m):", np.nanmin(g("tp")), np.nanmax(g("tp")))
+
+    data = np.stack([u10, v10, d2m, t2m, sp, tp, np.hypot(u10, v10)], axis=1).astype("<f4") 
+    lat = ds.latitude.values.astype(float)
+    lon = ds.longitude.values.astype(float)
+
+    # Match the grid conventions of the ERA5 file (lat order, lon range) so both sources line up.
+    try:
+        ref = load_dataset()
+        ref_lat, ref_lon = ref.latitude.values, ref.longitude.values
+        if ref_lon.min() < 0:
+            lon = np.where(lon > 180, lon - 360, lon)
+            order = np.argsort(lon)
+            lon, data = lon[order], data[..., order]
+        if (ref_lat[0] < ref_lat[-1]) != (lat[0] < lat[-1]):
+            lat, data = lat[::-1], data[:, :, ::-1, :]
+    except Exception as exc:
+        print(f"[forecast] could not align grid with ERA5 ({exc}); keeping native ECMWF grid.")
+
+    valid = np.array([(run_dt + timedelta(hours=int(h))).strftime("%Y-%m-%dT%H:%M") for h in step_h])
+    np.savez_compressed(_forecast_npz(run), data=np.ascontiguousarray(data), valid=valid, latitude=lat, longitude=lon)
+
+    grib.unlink(missing_ok=True)
+    for f in FORECAST_DIR.glob("ifs_*.grib2.*"):   # stray index files
+        f.unlink(missing_ok=True)
+
+
+def _prune_forecasts():
+    for old in sorted(FORECAST_DIR.glob("ifs_*_1deg.npz"))[:-FORECAST_KEEP_RUNS]:
+        old.unlink(missing_ok=True)
+
+
+def ensure_latest_forecast():
+    """Return the latest cached run id (YYYYMMDDHH), downloading it if needed."""
+    with _forecast_lock:
+        if _forecast_state["run"] and time.time() - _forecast_state["checked"] < FORECAST_REFRESH_SECONDS:
+            return _forecast_state["run"]
+        try:
+            # asking for the last step guarantees the run is complete (and 00/12 UTC only)
+            run_dt = _ecmwf_client.latest(type="fc", stream="oper", step=FORECAST_MAX_STEP, param="2t")
+            run = run_dt.strftime("%Y%m%d%H")
+            if not _forecast_npz(run).exists():
+                _download_forecast(run_dt)
+                _prune_forecasts()
+        except Exception:
+            cached = sorted(FORECAST_DIR.glob("ifs_*_1deg.npz"))
+            if not cached:
+                raise
+            run = cached[-1].stem.split("_")[1]      # fall back to last good run
+        _forecast_state.update(run=run, checked=time.time())
+        return run
+
+
+@lru_cache(maxsize=2)
+def load_forecast_run(run):
+    p = _forecast_npz(run)
+    if not p.is_file():
+        raise FileNotFoundError(f"Forecast run {run} not cached.")
+    z = np.load(p)
+    return {"data": z["data"], "valid": z["valid"].tolist(),
+            "latitude": z["latitude"].tolist(), "longitude": z["longitude"].tolist()}
+
+
+def forecast_dates(run):
+    return sorted({v[:10] for v in load_forecast_run(run)["valid"]})
+
+
+def forecast_frames_for_date(run, date_string):
+    r = load_forecast_run(run)
+    idx = [i for i, v in enumerate(r["valid"]) if v.startswith(date_string)]
+    if not idx:
+        return None
+    return {"times": [r["valid"][i][11:16] for i in idx], "data": np.ascontiguousarray(r["data"][idx]),
+            "latitude": r["latitude"], "longitude": r["longitude"]}
+
+
+@lru_cache(maxsize=4)
+def build_forecast_binary(run, date_string):
+    f = forecast_frames_for_date(run, date_string)
+    if f is None:
+        raise HTTPException(status_code=404, detail=f"Run {run} has no forecast for {date_string}. Check /api/forecast/runs.")
+    return pack_binary(f["data"], f["times"], f["latitude"], f["longitude"], date_string,
+                       source="ECMWF IFS open data (forecast)", kind="forecast", run=run, tp_period_hours=6)
+
+
+def forecast_or_http_error(run=None):
+    try:
+        run = run or ensure_latest_forecast()
+        load_forecast_run(run)
+        return run
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Forecast unavailable: {exc}") from exc
+
+
+# ======================= Routes =======================
 
 @app.get("/")
 def root():
@@ -118,6 +283,30 @@ def available_dates():
     timestamps = pd.to_datetime(ds.time.values, errors="coerce")
     dates = sorted({t.strftime("%Y-%m-%d") for t in timestamps if not pd.isna(t)})
     return {"dates": dates}
+
+
+
+@app.get("/api/available-dates")
+def all_available_dates():
+    ds = load_or_http_error()
+    timestamps = pd.to_datetime(ds.time.values, errors="coerce")
+
+    historical_dates = sorted({
+        t.strftime("%Y-%m-%d")
+        for t in timestamps
+        if not pd.isna(t)
+    })
+
+    run = forecast_or_http_error()
+    future_dates = forecast_dates(run)
+
+    return {
+        "historical_dates": historical_dates,
+        "forecast_dates": future_dates,
+        "forecast_run": run,
+        "dates": sorted(set(historical_dates) | set(future_dates))
+    }
+
 
 
 @app.get("/api/weather-binary")
@@ -145,3 +334,21 @@ def get_weather(requested_date: date = Query(..., alias="date")):
         "latitude": ds.latitude.values.tolist(), "longitude": ds.longitude.values.tolist(),
         "frames": frames
     })
+
+
+@app.get("/api/forecast/runs")
+def forecast_runs():
+    run = forecast_or_http_error()
+    return {"run": run, "run_time_utc": f"{run[:4]}-{run[4:6]}-{run[6:8]}T{run[8:]}:00Z",
+            "source": "ECMWF IFS open data (CC-BY-4.0)", "dates": forecast_dates(run)}
+
+
+@app.get("/api/forecast-binary")
+def get_forecast_binary(requested_date: date = Query(..., alias="date"),
+                        run: str | None = Query(None, pattern=r"^\d{10}$")):
+    run = forecast_or_http_error(run)
+    body = build_forecast_binary(run, requested_date.isoformat())
+    return Response(content=body, media_type="application/octet-stream",
+                    headers={"Cache-Control": "public, max-age=900", "X-Weather-Format": "nfd-f32-v1",
+                             "X-Forecast-Run": run})
+
