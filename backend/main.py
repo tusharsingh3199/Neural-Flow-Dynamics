@@ -113,11 +113,14 @@ def get_frame_arrays(ds, timestamp):
     return [u10, v10, get_grid(ds, "d2m", timestamp), get_grid(ds, "t2m", timestamp), get_grid(ds, "sp", timestamp), get_grid(ds, "tp", timestamp), np.hypot(u10, v10)]
 
 
+RAW_UNITS = {"u10": "m/s", "v10": "m/s", "d2m": "K", "t2m": "K", "sp": "Pa", "tp": "m", "wind_speed": "m/s"}
+
+
 def pack_binary(data, times, lat, lon, date_string, **extra):
     """Shared binary packer: [uint32 header_len][json header][pad to 4][float32 data]."""
     metadata = {
         "date": date_string, "source": "ERA5 reanalysis", "variables": VARIABLES,
-        "units": UNITS, "times": times, "expected_times_utc": EXPECTED_TIMES,
+        "units": RAW_UNITS, "times": times, "expected_times_utc": EXPECTED_TIMES,
         "shape": list(data.shape), "latitude": lat, "longitude": lon,
         "dtype": "float32", "byte_order": "little",
         "layout": "time,variable,latitude,longitude", **extra,
@@ -140,8 +143,11 @@ def build_binary(date_string):
                        kind="reanalysis")
 
 
+FORECAST_CACHE_GLOB = "ifs_*_1deg_raw.npz"   # "_raw": SI units (K, Pa, m), same as the ERA5 file
+
+
 def _forecast_npz(run):
-    return FORECAST_DIR / f"ifs_{run}_1deg.npz"
+    return FORECAST_DIR / f"ifs_{run}_1deg_raw.npz"
 
 
 def _download_forecast(run_dt):
@@ -162,18 +168,20 @@ def _download_forecast(run_dt):
     step_h = (ds.step.values / np.timedelta64(1, "h")).astype(int)
     g = lambda v: ds[v].transpose("step", "latitude", "longitude").values.astype("float32")
 
+    # Keep the SAME raw units as the ERA5 file (K, Pa, m). The frontend (FIELD_CONFIG in
+    # WebGLWeatherLayer.jsx) does the K->degC, Pa->hPa, m->mm conversion; converting here as
+    # well made every forecast value fall off the colour scale (one flat colour).
     u10, v10 = g("u10"), g("v10")
-    d2m, t2m = g("d2m") - 273.15, g("t2m") - 273.15                            
-    sp = g("sp") / 100.0                                                     
-    acc = np.nan_to_num(g("tp"))                                             
-    tp = np.clip(np.diff(acc, axis=0, prepend=acc[:1]), 0, None) * 1000  
+    d2m, t2m = g("d2m"), g("t2m")                                              # Kelvin
+    sp = g("sp")                                                               # Pascal
+    acc = np.nan_to_num(g("tp"))                                               # metres, accumulated since step 0
+    tp = np.clip(np.diff(acc, axis=0, prepend=acc[:1]), 0, None)               # metres per 6 h step
 
-    print("d2m Celsius range:", np.nanmin(d2m), np.nanmax(d2m))
-    print("t2m Celsius range:", np.nanmin(t2m), np.nanmax(t2m))
-    print("sp hPa range:", np.nanmin(sp), np.nanmax(sp))
-    print("Raw tp range (m):", np.nanmin(g("tp")), np.nanmax(g("tp")))
+    print("t2m range (K):", np.nanmin(t2m), np.nanmax(t2m))
+    print("sp range (Pa):", np.nanmin(sp), np.nanmax(sp))
+    print("tp 6h range (m):", np.nanmin(tp), np.nanmax(tp))
 
-    data = np.stack([u10, v10, d2m, t2m, sp, tp, np.hypot(u10, v10)], axis=1).astype("<f4") 
+    data = np.stack([u10, v10, d2m, t2m, sp, tp, np.hypot(u10, v10)], axis=1).astype("<f4")
     lat = ds.latitude.values.astype(float)
     lon = ds.longitude.values.astype(float)
 
@@ -199,7 +207,7 @@ def _download_forecast(run_dt):
 
 
 def _prune_forecasts():
-    for old in sorted(FORECAST_DIR.glob("ifs_*_1deg.npz"))[:-FORECAST_KEEP_RUNS]:
+    for old in sorted(FORECAST_DIR.glob(FORECAST_CACHE_GLOB))[:-FORECAST_KEEP_RUNS]:
         old.unlink(missing_ok=True)
 
 
@@ -216,7 +224,7 @@ def ensure_latest_forecast():
                 _download_forecast(run_dt)
                 _prune_forecasts()
         except Exception:
-            cached = sorted(FORECAST_DIR.glob("ifs_*_1deg.npz"))
+            cached = sorted(FORECAST_DIR.glob(FORECAST_CACHE_GLOB))
             if not cached:
                 raise
             run = cached[-1].stem.split("_")[1]      # fall back to last good run
@@ -328,7 +336,7 @@ def get_weather(requested_date: date = Query(..., alias="date")):
     times = [f["time"] for f in frames]
     return JSONResponse(content={
         "date": requested_date.isoformat(), "source": "ERA5 reanalysis",
-        "grid": "Global; original dataset resolution", "units": UNITS,
+        "grid": "Global; original dataset resolution", "units": RAW_UNITS,
         "expected_times_utc": EXPECTED_TIMES, "available_times_utc": times,
         "missing_times_utc": [t for t in EXPECTED_TIMES if t not in times],
         "latitude": ds.latitude.values.tolist(), "longitude": ds.longitude.values.tolist(),
