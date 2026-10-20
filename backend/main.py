@@ -15,14 +15,15 @@ from ecmwf.opendata import Client
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "data" / "WeatherData(Sep-Oct2026).grib"
 EXPECTED_TIMES = ["00:00", "06:00", "12:00", "18:00"]
 VARIABLES = ["u10", "v10", "d2m", "t2m", "sp", "tp", "wind_speed"]
 SOURCE_VARIABLES = VARIABLES[:-1]
-UNITS = {"u10": "m/s", "v10": "m/s", "d2m": "degC", "t2m": "degC", "sp": "hPa", "tp": "mm", "wind_speed": "m/s"}
+# Raw SI units: the frontend converts them for display (see FIELD_CONFIG in WebGLWeatherLayer.jsx).
+UNITS = {"u10": "m/s", "v10": "m/s", "d2m": "K", "t2m": "K", "sp": "Pa", "tp": "m", "wind_speed": "m/s"}
 
 # ---------------- Forecast (ECMWF IFS open data) settings ----------------
 FORECAST_DIR = BASE_DIR / "data" / "forecast"
@@ -71,7 +72,7 @@ def load_dataset():
     if "valid_time" in ds.coords and ds["valid_time"].dims == ("time",):
         ds = ds.assign_coords(time=ds["valid_time"].values)
     if "time" not in ds.dims:
-        raise RuntimeError("No time dimension found. Run inspect_grib.py.")
+        raise RuntimeError("No time dimension found.")
     missing = [v for v in SOURCE_VARIABLES if v not in ds.data_vars]
     if missing:
         raise RuntimeError(f"Missing variables {missing}; found {list(ds.data_vars)}.")
@@ -86,7 +87,7 @@ def load_or_http_error():
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Could not read GRIB dataset: {exc}. Run inspect_grib.py.") from exc
+        raise HTTPException(status_code=500, detail=f"Could not read GRIB dataset: {exc}.") from exc
 
 
 def get_grid(ds, variable, timestamp):
@@ -103,24 +104,16 @@ def get_timestamps_for_date(ds, requested_date):
     return [t for t in timestamps if not pd.isna(t) and t.strftime("%Y-%m-%d") == day]
 
 
-def grid_to_json(values):
-    a = np.asarray(values, dtype=float)
-    return [[None if not np.isfinite(v) else float(v) for v in row] for row in a]
-
-
 def get_frame_arrays(ds, timestamp):
     u10, v10 = get_grid(ds, "u10", timestamp), get_grid(ds, "v10", timestamp)
     return [u10, v10, get_grid(ds, "d2m", timestamp), get_grid(ds, "t2m", timestamp), get_grid(ds, "sp", timestamp), get_grid(ds, "tp", timestamp), np.hypot(u10, v10)]
-
-
-RAW_UNITS = {"u10": "m/s", "v10": "m/s", "d2m": "K", "t2m": "K", "sp": "Pa", "tp": "m", "wind_speed": "m/s"}
 
 
 def pack_binary(data, times, lat, lon, date_string, **extra):
     """Shared binary packer: [uint32 header_len][json header][pad to 4][float32 data]."""
     metadata = {
         "date": date_string, "source": "ERA5 reanalysis", "variables": VARIABLES,
-        "units": RAW_UNITS, "times": times, "expected_times_utc": EXPECTED_TIMES,
+        "units": UNITS, "times": times, "expected_times_utc": EXPECTED_TIMES,
         "shape": list(data.shape), "latitude": lat, "longitude": lon,
         "dtype": "float32", "byte_order": "little",
         "layout": "time,variable,latitude,longitude", **extra,
@@ -136,7 +129,7 @@ def build_binary(date_string):
     ds = load_or_http_error()
     timestamps = get_timestamps_for_date(ds, date.fromisoformat(date_string))
     if not timestamps:
-        raise HTTPException(status_code=404, detail=f"No weather data found for {date_string}. Check /api/dates.")
+        raise HTTPException(status_code=404, detail=f"No weather data found for {date_string}. Check /api/available-dates.")
     data = np.stack([np.stack(get_frame_arrays(ds, t), axis=0) for t in timestamps])
     return pack_binary(data, [pd.Timestamp(t).strftime("%H:%M") for t in timestamps],
                        ds.latitude.values.tolist(), ds.longitude.values.tolist(), date_string,
@@ -176,11 +169,6 @@ def _download_forecast(run_dt):
     sp = g("sp")                                                               # Pascal
     acc = np.nan_to_num(g("tp"))                                               # metres, accumulated since step 0
     tp = np.clip(np.diff(acc, axis=0, prepend=acc[:1]), 0, None)               # metres per 6 h step
-
-    print("t2m range (K):", np.nanmin(t2m), np.nanmax(t2m))
-    print("sp range (Pa):", np.nanmin(sp), np.nanmax(sp))
-    print("tp 6h range (m):", np.nanmin(tp), np.nanmax(tp))
-
     data = np.stack([u10, v10, d2m, t2m, sp, tp, np.hypot(u10, v10)], axis=1).astype("<f4")
     lat = ds.latitude.values.astype(float)
     lon = ds.longitude.values.astype(float)
@@ -259,7 +247,7 @@ def forecast_frames_for_date(run, date_string):
 def build_forecast_binary(run, date_string):
     f = forecast_frames_for_date(run, date_string)
     if f is None:
-        raise HTTPException(status_code=404, detail=f"Run {run} has no forecast for {date_string}. Check /api/forecast/runs.")
+        raise HTTPException(status_code=404, detail=f"Run {run} has no forecast for {date_string}. Check /api/available-dates.")
     return pack_binary(f["data"], f["times"], f["latitude"], f["longitude"], date_string,
                        source="ECMWF IFS open data (forecast)", kind="forecast", run=run, tp_period_hours=6)
 
@@ -285,70 +273,19 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/dates")
+@app.get("/api/available-dates")
 def available_dates():
     ds = load_or_http_error()
-    timestamps = pd.to_datetime(ds.time.values, errors="coerce")
-    dates = sorted({t.strftime("%Y-%m-%d") for t in timestamps if not pd.isna(t)})
-    return {"dates": dates}
-
-
-
-@app.get("/api/available-dates")
-def all_available_dates():
-    ds = load_or_http_error()
-    timestamps = pd.to_datetime(ds.time.values, errors="coerce")
-
-    historical_dates = sorted({
-        t.strftime("%Y-%m-%d")
-        for t in timestamps
-        if not pd.isna(t)
-    })
-
+    historical = sorted({t.strftime("%Y-%m-%d") for t in pd.to_datetime(ds.time.values) if not pd.isna(t)})
     run = forecast_or_http_error()
-    future_dates = forecast_dates(run)
-
-    return {
-        "historical_dates": historical_dates,
-        "forecast_dates": future_dates,
-        "forecast_run": run,
-        "dates": sorted(set(historical_dates) | set(future_dates))
-    }
-
+    forecast = forecast_dates(run)
+    return {"dates": sorted(set(historical) | set(forecast)), "forecast_dates": forecast, "forecast_run": run}
 
 
 @app.get("/api/weather-binary")
 def get_weather_binary(requested_date: date = Query(..., alias="date")):
     body = build_binary(requested_date.isoformat())
     return Response(content=body, media_type="application/octet-stream", headers={"Cache-Control": "public, max-age=3600", "X-Weather-Format": "nfd-f32-v1"})
-
-
-@app.get("/api/weather")
-def get_weather(requested_date: date = Query(..., alias="date")):
-    ds = load_or_http_error()
-    timestamps = get_timestamps_for_date(ds, requested_date)
-    if not timestamps:
-        raise HTTPException(status_code=404, detail=f"No weather data found for {requested_date}. Check /api/dates.")
-    frames = []
-    for timestamp in timestamps:
-        fields = get_frame_arrays(ds, timestamp)
-        frames.append({"time": pd.Timestamp(timestamp).strftime("%H:%M"), **{name: grid_to_json(values) for name, values in zip(VARIABLES, fields)}})
-    times = [f["time"] for f in frames]
-    return JSONResponse(content={
-        "date": requested_date.isoformat(), "source": "ERA5 reanalysis",
-        "grid": "Global; original dataset resolution", "units": RAW_UNITS,
-        "expected_times_utc": EXPECTED_TIMES, "available_times_utc": times,
-        "missing_times_utc": [t for t in EXPECTED_TIMES if t not in times],
-        "latitude": ds.latitude.values.tolist(), "longitude": ds.longitude.values.tolist(),
-        "frames": frames
-    })
-
-
-@app.get("/api/forecast/runs")
-def forecast_runs():
-    run = forecast_or_http_error()
-    return {"run": run, "run_time_utc": f"{run[:4]}-{run[4:6]}-{run[6:8]}T{run[8:]}:00Z",
-            "source": "ECMWF IFS open data (CC-BY-4.0)", "dates": forecast_dates(run)}
 
 
 @app.get("/api/forecast-binary")
@@ -359,4 +296,3 @@ def get_forecast_binary(requested_date: date = Query(..., alias="date"),
     return Response(content=body, media_type="application/octet-stream",
                     headers={"Cache-Control": "public, max-age=900", "X-Weather-Format": "nfd-f32-v1",
                              "X-Forecast-Run": run})
-

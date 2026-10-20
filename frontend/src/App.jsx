@@ -34,30 +34,26 @@ async function fetchWeatherBinary(date, isForecast, run) {
   return { ...metadata, values: new Float32Array(buffer, dataStart, count) };
 }
 
+// One time step -> { time, t2m: Float32Array, ... } (flat, row-major lat x lon).
 function makeFrame(payload, timeIndex) {
   const [, variableCount, height, width] = payload.shape;
+  const size = height * width;
   const frame = { time: payload.times[timeIndex] };
   payload.variables.forEach((name, vi) => {
-    const start = (timeIndex * variableCount + vi) * height * width;
-    const values = payload.values.subarray(start, start + height * width);
-    frame[name] = Array.from({ length: height }, (_, y) =>
-      Array.from(values.subarray(y * width, (y + 1) * width), v => Number.isFinite(v) ? v : null)
-    );
+    const start = (timeIndex * variableCount + vi) * size;
+    frame[name] = payload.values.subarray(start, start + size);
   });
   return frame;
 }
 
 export default function App() {
   const [dates, setDates] = useState([]);
-  const [forecastDates, setForecastDates] = useState([]);
-  const [forecastRun, setForecastRun] = useState(null);
   const [cache, setCache] = useState({});
   const [coords, setCoords] = useState(null);
   const [slot, setSlot] = useState(0);
   const [layer, setLayer] = useState("temperature");
   const [playing, setPlaying] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [shown] = useState(null);
   const [error, setError] = useState("");
   const [windOn, setWindOn] = useState(true);
   const cacheRef = useRef({});
@@ -106,8 +102,6 @@ export default function App() {
         if (!list.length) throw new Error("No data available");
         forecastDatesRef.current = new Set(p.forecast_dates || []);
         forecastRunRef.current = p.forecast_run || null;
-        setForecastDates(p.forecast_dates || []);
-        setForecastRun(p.forecast_run || null);
         datesRef.current = list;
         viewDate.current = list[0];
         setDates(list);
@@ -141,7 +135,6 @@ export default function App() {
   const currentDate = current?.date, currentIdx = current?.idx;
   const currentPayload = currentDate ? cache[currentDate] : null;
   const target = useMemo(() => currentPayload && currentIdx != null ? makeFrame(currentPayload, currentIdx) : null, [currentPayload, currentIdx]);
-  const displayedFrame = target ?? shown;
   const loading = !!current && !target;
 
   useEffect(() => {
@@ -165,7 +158,7 @@ export default function App() {
 
   return (
     <div className="nfd-app">
-      <WeatherMap coords={coords} frame={displayedFrame} layer={layer} showWind={windOn} />
+      <WeatherMap coords={coords} frame={target} layer={layer} showWind={windOn} />
       <div className="layers">
         {LAYERS.map(id => (
           <button key={id} title={id} aria-label={id} className={id === layer ? "on" : ""} onClick={() => setLayer(id)}>
