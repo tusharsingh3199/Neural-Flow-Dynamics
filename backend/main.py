@@ -200,22 +200,25 @@ def _prune_forecasts():
 
 
 def ensure_latest_forecast():
-    """Return the latest cached run id (YYYYMMDDHH), downloading it if needed."""
     with _forecast_lock:
-        if _forecast_state["run"] and time.time() - _forecast_state["checked"] < FORECAST_REFRESH_SECONDS:
-            return _forecast_state["run"]
+        FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+        cached = sorted(FORECAST_DIR.glob(FORECAST_CACHE_GLOB))
+
+        if cached:
+            run = cached[-1].stem.split("_")[1]
+            _forecast_state.update(run=run, checked=time.time())
+            return run
+
         try:
-            # asking for the last step guarantees the run is complete (and 00/12 UTC only)
-            run_dt = _ecmwf_client.latest(type="fc", stream="oper", step=FORECAST_MAX_STEP, param="2t")
+            run_dt = _ecmwf_client.latest(type="fc", stream="oper", step=FORECAST_MAX_STEP, param="2t",)
+
             run = run_dt.strftime("%Y%m%d%H")
-            if not _forecast_npz(run).exists():
-                _download_forecast(run_dt)
-                _prune_forecasts()
-        except Exception:
-            cached = sorted(FORECAST_DIR.glob(FORECAST_CACHE_GLOB))
-            if not cached:
-                raise
-            run = cached[-1].stem.split("_")[1]      # fall back to last good run
+            _download_forecast(run_dt)
+            _prune_forecasts()
+
+        except Exception as exc:
+            raise RuntimeError(f"No cached forecast exists and ECMWF download failed: {exc}") from exc
+
         _forecast_state.update(run=run, checked=time.time())
         return run
 
